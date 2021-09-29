@@ -390,10 +390,12 @@ func (t *tcpFilter) Match(flow *flowpb.Flow, fc *FlowContext) bool {
 	}
 
 	if t.srcPort == 0 {
-		if tcp.Flags != nil && tcp.Flags.SYN && !tcp.Flags.ACK && !tcp.Flags.FIN && !tcp.Flags.RST {
-			// save wildcarded source port
+		// save wildcarded source port but only if not already set. This fixes the wildcard port to the first
+		// SYN flow within the tested flows.
+		sourcePort, exists := fc.tcpPorts[tcp.DestinationPort]
+		if !exists && tcp.Flags != nil && tcp.Flags.SYN && !tcp.Flags.ACK && !tcp.Flags.FIN && !tcp.Flags.RST {
 			fc.tcpPorts[tcp.DestinationPort] = tcp.SourcePort
-		} else if tcp.SourcePort != fc.tcpPorts[tcp.DestinationPort] {
+		} else if tcp.SourcePort != sourcePort {
 			return false
 		}
 	}
