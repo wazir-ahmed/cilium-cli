@@ -398,6 +398,9 @@ func (a *Action) matchFlowRequirements(ctx context.Context, flows flowsSet, req 
 
 func (a *Action) GetEgressRequirements(p FlowParameters) (reqs []filters.FlowSetRequirement) {
 	var egress filters.FlowSetRequirement
+	var http filters.FlowSetRequirement
+	have_http := false
+
 	srcIP := a.src.Address()
 	dstIP := a.dst.Address()
 
@@ -442,7 +445,7 @@ func (a *Action) GetEgressRequirements(p FlowParameters) (reqs []filters.FlowSet
 	case TCP:
 		tcpRequest := filters.TCP(0, a.dst.Port())
 		tcpResponse := filters.TCP(a.dst.Port(), 0)
-		if p.NodePort != 0 {
+		if p.NodePort != 0 && p.NodePort != a.dst.Port() {
 			tcpRequest = filters.Or(filters.TCP(0, p.NodePort), tcpRequest)
 			tcpResponse = filters.Or(filters.TCP(p.NodePort, 0), tcpResponse)
 		}
@@ -469,17 +472,6 @@ func (a *Action) GetEgressRequirements(p FlowParameters) (reqs []filters.FlowSet
 					{Filter: filters.And(filters.Or(filters.And(ipRequest, tcpRequest), filters.And(ipResponse, tcpResponse)), filters.Drop()), Msg: "L3/L4 Drop"},
 				},
 			}
-			if a.expEgress.Drop {
-				// L7 drop
-				egress.Middle = append(egress.Middle, filters.FlowRequirement{Filter: filters.And(ipRequest, tcpRequest, filters.L7Drop()), Msg: "L7 Drop"})
-			}
-			if a.expEgress.HTTP.Status != "" || a.expEgress.HTTP.Method != "" || a.expEgress.HTTP.URL != "" {
-				code := uint32(math.MaxUint32)
-				if s, err := strconv.Atoi(a.expEgress.HTTP.Status); err == nil {
-					code = uint32(s)
-				}
-				egress.Middle = append(egress.Middle, filters.FlowRequirement{Filter: filters.And(ipRequest, tcpRequest, filters.HTTP(code, a.expEgress.HTTP.Method, a.expEgress.HTTP.URL)), Msg: "HTTP"})
-			}
 			if p.RSTAllowed {
 				// For the connection termination, we will either see:
 				// a) FIN + FIN b) FIN + RST c) RST
@@ -487,6 +479,23 @@ func (a *Action) GetEgressRequirements(p FlowParameters) (reqs []filters.FlowSet
 				egress.Last = filters.FlowRequirement{Filter: filters.And(filters.Or(filters.And(ipRequest, tcpRequest), filters.And(ipResponse, tcpResponse)), filters.Or(filters.FIN(), filters.RST())), Msg: "FIN or RST", SkipOnAggregation: true}
 			} else {
 				egress.Except = append(egress.Except, filters.FlowRequirement{Filter: filters.And(filters.Or(filters.And(ipRequest, tcpRequest), filters.And(ipResponse, tcpResponse)), filters.RST()), Msg: "RST"})
+			}
+			if a.expEgress.L7Proxy || a.expEgress.HTTP.Status != "" || a.expEgress.HTTP.Method != "" || a.expEgress.HTTP.URL != "" {
+				// HTTP access logs may come from a separate Envoy proxy upstream connection which may be
+				// kept open. Add a separate flow requirement with FIN filter replaced with a L7/HTTP
+				// filter to allow for both a separate connection and a missing FIN.
+				http = egress
+				have_http = true
+				if a.expEgress.Drop {
+					// L7 drop
+					http.Last = filters.FlowRequirement{Filter: filters.And(ipRequest, tcpRequest, filters.L7Drop()), Msg: "L7 Drop"}
+				} else if a.expEgress.HTTP.Status != "" || a.expEgress.HTTP.Method != "" || a.expEgress.HTTP.URL != "" {
+					code := uint32(math.MaxUint32)
+					if s, err := strconv.Atoi(a.expEgress.HTTP.Status); err == nil {
+						code = uint32(s)
+					}
+					http.Last = filters.FlowRequirement{Filter: filters.And(ipRequest, tcpRequest, filters.HTTP(code, a.expEgress.HTTP.Method, a.expEgress.HTTP.URL)), Msg: "HTTP"}
+				}
 			}
 		}
 	case UDP:
@@ -517,7 +526,10 @@ func (a *Action) GetEgressRequirements(p FlowParameters) (reqs []filters.FlowSet
 		reqs = append(reqs, dns)
 	}
 	reqs = append(reqs, egress)
-
+	if have_http {
+		reqs = append(reqs, http)
+	}
+	a.Infof("Egress requiurements (%d): %v", len(reqs), reqs)
 	return reqs
 }
 
